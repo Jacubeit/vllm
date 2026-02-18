@@ -276,14 +276,13 @@ class Scheduler(SchedulerInterface):
         # Compaction triggers when total tokens exceed this threshold.
         # keep_tokens is twice the sliding window to have headroom.
         if self._sliding_window is not None:
-            # Keep 1024 tokens — the sliding window manager handles
-            # GPU-side KV eviction independently; CPU-side we only
-            # need enough to avoid re-encoding recent features.
-            self._compaction_keep_tokens = 1024
-            # Compact as soon as we accumulate 2x the keep amount.
-            # This fires every ~2.5 minutes per stream, keeping the
-            # O(n) scheduler paths (encoder scheduling, block hash
-            # computation) fast.
+            # Keep half the sliding window worth of tokens.  The
+            # sliding window manager handles GPU-side KV eviction
+            # independently; CPU-side we keep enough to avoid
+            # re-encoding recent features while compacting every
+            # ~5 minutes per stream.
+            self._compaction_keep_tokens = self._sliding_window // 2  # 4096
+            # Compact when we reach 2x the keep amount.
             self._compaction_threshold = self._compaction_keep_tokens * 2
             logger.info(
                 "Session compaction enabled: sw=%d, keep=%d, threshold=%d",

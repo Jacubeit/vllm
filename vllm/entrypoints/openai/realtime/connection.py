@@ -52,6 +52,9 @@ class RealtimeConnection:
     # Maximum consecutive restarts with no text produced before giving
     # up (mirrors voxtral.c's STREAM_EMPTY_RESTARTS_FOR_FULL_RESET).
     MAX_EMPTY_RESTARTS: int = 5
+    # Proactive rotation: restart pipeline after this many tokens to
+    # prevent unbounded growth without needing compaction.
+    MAX_SESSION_TOKENS: int = 2048
 
     def __init__(self, websocket: WebSocket, serving: OpenAIServingRealtime):
         self.websocket = websocket
@@ -211,6 +214,8 @@ class RealtimeConnection:
         """
         empty_restarts = 0
 
+        restart_count = 0
+
         while self._is_connected:
             # Create a fresh audio + token pipeline for each attempt.
             audio_stream = self.audio_stream_generator()
@@ -223,13 +228,25 @@ class RealtimeConnection:
                 produced_text = await self._run_generation(
                     streaming_input_gen, input_stream
                 )
-            finally:
-                # Explicitly close generators so buffer_realtime_audio's
-                # finally block runs immediately (cancels feed_audio and
-                # feed_tokens tasks), releasing the audio_stream_generator
-                # before we create a new one in the next iteration.
-                await streaming_input_gen.aclose()
-                await audio_stream.aclose()
+            except Exception:
+                logger.exception(
+                    "%s: _run_generation raised unexpectedly",
+                    self.connection_id,
+                )
+                produced_text = None
+
+            # After abort, the engine may still hold a reference to
+            # streaming_input_gen (which wraps buffer_realtime_audio).
+            # Calling aclose() on a running async generator raises
+            # RuntimeError.  Instead, push a sentinel through the audio
+            # queue so feed_audio() exits naturally, which causes
+            # buffer_realtime_audio to finish and clean up its tasks.
+            if produced_text is not None:
+                # Deaf restart path — unblock the old pipeline.
+                self.audio_queue.put_nowait(None)
+                # Give the event loop a moment to propagate the
+                # sentinel through the generator chain.
+                await asyncio.sleep(0.1)
 
             if produced_text is None:
                 # Normal completion or disconnect — stop the loop.
@@ -253,6 +270,14 @@ class RealtimeConnection:
             else:
                 # Successful text production — reset the counter.
                 empty_restarts = 0
+
+            restart_count += 1
+            logger.info(
+                "%s: restarting generation pipeline (restart #%d, queue=%d)",
+                self.connection_id,
+                restart_count,
+                self.audio_queue.qsize(),
+            )
 
     async def _run_generation(
         self,
@@ -349,6 +374,20 @@ class RealtimeConnection:
                         # Abort the engine request to free resources.
                         await self.serving.engine_client.abort(request_id)
                         break
+
+                    # --- Proactive rotation ---
+                    # Restart before compaction fires, avoiding the
+                    # compaction-induced deafness entirely.
+                    if total_tokens >= self.MAX_SESSION_TOKENS:
+                        logger.info(
+                            "%s: proactive rotation at %d tokens "
+                            "(%d text). Aborting for restart.",
+                            request_id[:20],
+                            total_tokens,
+                            total_text_tokens,
+                        )
+                        await self.serving.engine_client.abort(request_id)
+                        return True  # had text, trigger restart
 
                     # --- Periodic status log ---
                     now = _time.monotonic()
