@@ -1004,26 +1004,53 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
 
-        # --- In-place compaction of CPU-side metadata ---
-        # Trim already-processed mm_features and block_hashes so the
-        # scheduler's O(n) encoder-input scan stays bounded.  Only fires
-        # for resumable (streaming) sessions once enough features
-        # accumulate.  We free encoder-cache references for the trimmed
-        # features BEFORE the trim (free_encoder_input looks up by index).
+        # --- Session compaction (keep KV, trim CPU metadata) ---
+        # When a streaming session exceeds keep_tokens * 1.25, trim
+        # tokens, mm_features, and block_hashes from the front while
+        # preserving KV cache blocks for the remaining tokens.  No
+        # re-prefill — compaction_offset restores RoPE continuity.
+        #
+        # The sliding window controls how far back the model attends.
+        # We keep exactly that many tokens — the model can't use more.
+        # If no sliding window, fall back to max_model_len // 2.
         if session.resumable:
-            trim_count = session.num_compactable_mm_features()
-            if trim_count > 0:
-                for i in range(trim_count):
-                    self.encoder_cache_manager.free_encoder_input(session, i)
-                session.compact_mm_features(trim_count)
-                logger.debug(
-                    "Compacted session %s: trimmed %d mm_features, "
-                    "%d remaining, %d total tokens",
-                    session.request_id,
-                    trim_count,
-                    len(session.mm_features),
-                    session.num_tokens,
+            sliding_window = self.vllm_config.model_config.get_sliding_window()
+            keep_tokens = sliding_window if sliding_window else self.max_model_len // 2
+            # 25% hysteresis to avoid compacting every cycle.
+            if session.num_tokens > keep_tokens + keep_tokens // 4:
+                # Free encoder-cache entries for mm_features that will
+                # be trimmed BEFORE the trim (lookup is by index).
+                trim_count = session.num_tokens - keep_tokens
+                for i, feat in enumerate(session.mm_features):
+                    end_pos = feat.mm_position.offset + feat.mm_position.length
+                    if end_pos <= trim_count:
+                        self.encoder_cache_manager.free_encoder_input(session, i)
+                    else:
+                        break
+
+                tokens_trimmed, mm_trimmed, blocks_trimmed = session.compact_session(
+                    keep_tokens, self.block_size
                 )
+                if tokens_trimmed > 0:
+                    # Trim leading blocks from the block table.
+                    # These are null_blocks (evicted by sliding window)
+                    # or real blocks for trimmed tokens.
+                    self.kv_cache_manager.compact_blocks(
+                        session.request_id, blocks_trimmed
+                    )
+                    logger.info(
+                        "Compacted session %s: trimmed %d tokens, "
+                        "%d mm_features, %d blocks, %d tokens remaining, "
+                        "%d mm_features remaining, "
+                        "compaction_offset=%d",
+                        session.request_id,
+                        tokens_trimmed,
+                        mm_trimmed,
+                        blocks_trimmed,
+                        session.num_tokens,
+                        len(session.mm_features),
+                        session._num_tokens_compacted,
+                    )
 
     def _make_cached_request_data(
         self,

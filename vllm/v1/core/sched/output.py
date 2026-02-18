@@ -42,6 +42,9 @@ class NewRequestData:
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
 
+    # Cumulative tokens trimmed by session compaction (for RoPE continuity).
+    compaction_offset: int = 0
+
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
@@ -62,6 +65,7 @@ class NewRequestData:
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
+            compaction_offset=getattr(request, "_num_tokens_compacted", 0),
             prefill_token_ids=prefill_token_ids,
         )
 

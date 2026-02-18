@@ -385,6 +385,15 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def compact_blocks(self, request_id: str, num_blocks_to_trim: int) -> None:
+        """Trim leading null_blocks from req_to_blocks after compaction.
+
+        Args:
+            request_id: The request ID.
+            num_blocks_to_trim: Number of leading blocks to remove.
+        """
+        self.coordinator.compact_blocks(request_id, num_blocks_to_trim)
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:

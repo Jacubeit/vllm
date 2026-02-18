@@ -230,6 +230,18 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.remove_skipped_blocks(request_id, total_computed_tokens)
 
+    def compact_blocks(self, request_id: str, num_blocks_to_trim: int) -> None:
+        """Trim leading null_blocks from req_to_blocks after compaction.
+
+        Delegates to each single-type manager.
+
+        Args:
+            request_id: The request ID.
+            num_blocks_to_trim: Number of leading blocks to remove.
+        """
+        for manager in self.single_type_managers:
+            manager.compact_blocks(request_id, num_blocks_to_trim)
+
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """
         Get the blocks for the request.

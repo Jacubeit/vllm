@@ -5,7 +5,7 @@ import enum
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -174,6 +174,10 @@ class Request:
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
 
+        # Session compaction: cumulative tokens trimmed from the front.
+        # Used for RoPE position continuity and sliding-window eviction.
+        self._num_tokens_compacted: int = 0
+
     @property
     @deprecated(
         "Request.eos_token_id will be removed in v0.18. "
@@ -317,6 +321,111 @@ class Request:
         # guarded for empty hashes so this is safe.
         self.block_hashes.clear()
         self._block_hasher = None
+
+    def compact_session(
+        self, keep_tokens: int, block_size: int
+    ) -> tuple[int, int, int]:
+        """Compact CPU-side session metadata while preserving KV cache.
+
+        Trims tokens, mm_features, and block_hashes from the front,
+        keeping the most recent tokens.  The KV cache entries for kept
+        tokens remain valid — no re-prefill is needed.  The caller must
+        trim the leading blocks from the KV block table to match.
+
+        ``num_computed_tokens`` is reduced by ``trim_count`` so it stays
+        a valid physical index into the (now shorter) token lists.
+        ``_num_tokens_compacted`` tracks the cumulative logical offset
+        for RoPE position continuity and sliding-window eviction.
+
+        Must be called only when ``_output_token_ids`` is empty (i.e.
+        after output tokens have been folded into the prompt during a
+        streaming session update).
+
+        The caller must:
+        1. Free encoder-cache entries for trimmed mm_features **before**
+           this call (``free_encoder_input`` looks up features by index).
+        2. Trim leading KV cache blocks **after** this call
+           (``compact_blocks(request_id, num_trimmed_blocks)``).
+
+        Args:
+            keep_tokens: Number of recent tokens to retain.
+            block_size: KV cache block size for alignment.
+
+        Returns:
+            (tokens_trimmed, mm_features_trimmed, blocks_trimmed)
+        """
+        num_tokens = len(self._all_token_ids)
+        if num_tokens <= keep_tokens:
+            return 0, 0, 0
+
+        assert not self._output_token_ids, (
+            "compact_session must be called after output tokens are "
+            "folded into prompt_token_ids"
+        )
+
+        trim_count = num_tokens - keep_tokens
+        # Align to block boundary so block trimming is clean.
+        trim_count = (trim_count // block_size) * block_size
+        if trim_count <= 0:
+            return 0, 0, 0
+
+        # --- Count mm_features to trim ---
+        # Features whose entire span falls within the trimmed range.
+        mm_trim = 0
+        for feat in self.mm_features:
+            end_pos = feat.mm_position.offset + feat.mm_position.length
+            if end_pos <= trim_count:
+                mm_trim += 1
+            else:
+                break
+
+        # Clamp trim_count so we never trim into the first remaining
+        # mm_feature.  Re-align to block boundary after clamping.
+        if mm_trim < len(self.mm_features):
+            first_kept = self.mm_features[mm_trim]
+            trim_count = min(trim_count, first_kept.mm_position.offset)
+            trim_count = (trim_count // block_size) * block_size
+
+        if trim_count == 0:
+            return 0, 0, 0
+
+        # --- Trim token lists from the front ---
+        del self._all_token_ids[:trim_count]
+        assert self.prompt_token_ids is not None
+        del self.prompt_token_ids[:trim_count]
+
+        # --- Trim mm_features and rebase remaining offsets ---
+        if mm_trim > 0:
+            del self.mm_features[:mm_trim]
+        for i, feat in enumerate(self.mm_features):
+            new_offset = feat.mm_position.offset - trim_count
+            assert new_offset >= 0, (
+                f"mm_feature[{i}] offset {feat.mm_position.offset} "
+                f"< trim_count {trim_count}"
+            )
+            self.mm_features[i] = replace(
+                feat,
+                mm_position=replace(feat.mm_position, offset=new_offset),
+            )
+
+        # --- Adjust counters (keep KV, no re-prefill) ---
+        self.num_computed_tokens -= trim_count
+        self.num_prompt_tokens = len(self.prompt_token_ids)
+        self._num_tokens_compacted += trim_count
+
+        # --- Clear output token ids (should already be empty) ---
+        self._output_token_ids.clear()
+
+        # --- Clear prefix-cache state ---
+        self.num_cached_tokens = -1
+        self.skip_reading_prefix_cache = True
+
+        # --- Clear block hashes (chain is broken) ---
+        self.block_hashes.clear()
+        self._block_hasher = None
+
+        num_trimmed_blocks = trim_count // block_size
+        return trim_count, mm_trim, num_trimmed_blocks
 
     def get_finished_reason(self) -> FinishReason | None:
         return RequestStatus.get_finished_reason(self.status)
