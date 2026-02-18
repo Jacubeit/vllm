@@ -967,6 +967,7 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                compaction_offset=new_req_data.compaction_offset,
             )
             self.requests[req_id] = req_state
 
@@ -1194,6 +1195,9 @@ class GPUModelRunner(
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
         )
+
+        # Session compaction: propagate cumulative trim offset for RoPE.
+        req_state.compaction_offset = new_req_data.compaction_offset
 
         # Clear `output_token_ids` as previous output tokens are now part of
         # `prompt_token_ids`.
@@ -1570,6 +1574,15 @@ class GPUModelRunner(
 
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+
+        # Session compaction: add compaction offsets to positions for RoPE.
+        # positions_np currently holds physical (bounded) positions used above
+        # for token_indices and slot_mapping. For RoPE, we need logical
+        # positions that reflect the true conversation position so that
+        # Q vectors match the K vectors already in the KV cache.
+        compaction_offsets = self.input_batch.compaction_offsets_cpu[req_indices]
+        if compaction_offsets.any():
+            positions_np += compaction_offsets
 
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0

@@ -252,6 +252,21 @@ class EncoderCacheManager:
         for input_id in input_ids:
             self.free_encoder_input(request, input_id)
 
+    def compact_encoder_cache(
+        self, request: Request, num_features_to_trim: int
+    ) -> None:
+        """Free encoder cache references for features that will be trimmed.
+
+        Must be called *before* the features are removed from
+        ``request.mm_features`` so that the identifiers are still accessible.
+
+        Args:
+            request: The request being compacted.
+            num_features_to_trim: Number of leading mm_features to free.
+        """
+        for input_id in range(num_features_to_trim):
+            self.free_encoder_input(request, input_id)
+
     def get_freed_mm_hashes(self) -> list[str]:
         """Get and clear the list of recently freed encoder cache entries.
 

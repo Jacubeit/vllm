@@ -49,6 +49,9 @@ class CachedRequestState:
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0
 
+    # Session compaction: cumulative tokens trimmed (for RoPE continuity).
+    compaction_offset: int = 0
+
     # for pooling models
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None
@@ -136,6 +139,9 @@ class InputBatch:
             pin_memory=pin_memory,
         )
         self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
+
+        # Session compaction: cumulative tokens trimmed per request (for RoPE).
+        self.compaction_offsets_cpu = np.zeros(max_num_reqs, dtype=np.int32)
 
         # Block table.
         self.block_table = MultiGroupBlockTable(
@@ -422,6 +428,9 @@ class InputBatch:
         else:
             raise NotImplementedError("Unrecognized request type")
 
+        # Session compaction offset (for RoPE continuity).
+        self.compaction_offsets_cpu[req_index] = request.compaction_offset
+
         # Speculative decoding: by default 1 token is generated.
         self.num_accepted_tokens_cpu[req_index] = 1
 
@@ -610,6 +619,10 @@ class InputBatch:
             self.num_accepted_tokens_cpu[i2],
             self.num_accepted_tokens_cpu[i1],
         )
+        self.compaction_offsets_cpu[i1], self.compaction_offsets_cpu[i2] = (
+            self.compaction_offsets_cpu[i2],
+            self.compaction_offsets_cpu[i1],
+        )
 
         swap_dict_values(self.generators, i1, i2)
         swap_dict_values(self.bad_words_token_ids, i1, i2)
@@ -729,6 +742,9 @@ class InputBatch:
                 last_req_index
             ]
             self.num_accepted_tokens_cpu[empty_index] = self.num_accepted_tokens_cpu[
+                last_req_index
+            ]
+            self.compaction_offsets_cpu[empty_index] = self.compaction_offsets_cpu[
                 last_req_index
             ]
             generator = self.generators.pop(last_req_index, None)

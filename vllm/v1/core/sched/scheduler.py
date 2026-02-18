@@ -48,7 +48,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, SlidingWindowSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -264,6 +264,36 @@ class Scheduler(SchedulerInterface):
             )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+
+        # Session compaction parameters.
+        # Determine the sliding window size from kv_cache_config (if any).
+        self._sliding_window: int | None = None
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, SlidingWindowSpec):
+                self._sliding_window = spec.sliding_window
+                break
+        # Compaction triggers when total tokens exceed this threshold.
+        # keep_tokens is twice the sliding window to have headroom.
+        if self._sliding_window is not None:
+            # Keep 1024 tokens — the sliding window manager handles
+            # GPU-side KV eviction independently; CPU-side we only
+            # need enough to avoid re-encoding recent features.
+            self._compaction_keep_tokens = 1024
+            # Compact as soon as we accumulate 2x the keep amount.
+            # This fires every ~2.5 minutes per stream, keeping the
+            # O(n) scheduler paths (encoder scheduling, block hash
+            # computation) fast.
+            self._compaction_threshold = self._compaction_keep_tokens * 2
+            logger.info(
+                "Session compaction enabled: sw=%d, keep=%d, threshold=%d",
+                self._sliding_window,
+                self._compaction_keep_tokens,
+                self._compaction_threshold,
+            )
+        else:
+            self._compaction_keep_tokens = 0
+            self._compaction_threshold = 0
 
     def _mamba_block_aligned_split(
         self,
@@ -969,7 +999,6 @@ class Scheduler(SchedulerInterface):
 
         Discards the last sampled output token from the prior input chunk.
         """
-
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
         num_computed_tokens = session.num_computed_tokens
@@ -1001,8 +1030,88 @@ class Scheduler(SchedulerInterface):
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
 
+        # --- Session compaction ---
+        # Trim old tokens/features when the session exceeds the threshold
+        # to prevent unbounded CPU-side metadata growth.
+        if session.num_tokens % 500 == 0:
+            logger.info(
+                "Session %s: num_tokens=%d, prompt_tokens=%d, "
+                "mm_features=%d, all_token_ids=%d",
+                session.request_id[:20],
+                session.num_tokens,
+                session.num_prompt_tokens,
+                len(session.mm_features),
+                len(session._all_token_ids),
+            )
+        if (
+            self._compaction_threshold > 0
+            and session.resumable
+            and session.num_tokens > self._compaction_threshold
+        ):
+            try:
+                self._compact_session(session)
+            except Exception:
+                logger.exception(
+                    "Session compaction FAILED for %s (num_tokens=%d)",
+                    session.request_id,
+                    session.num_tokens,
+                )
+
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    def _compact_session(self, session: Request) -> None:
+        """Perform session compaction: trim old tokens, features, blocks."""
+        # Free encoder cache entries for features that will be trimmed
+        # *before* they are removed from session.mm_features.
+        total_tokens = len(session._all_token_ids)
+        trim_count_approx = total_tokens - self._compaction_keep_tokens
+        trim_count_approx = (trim_count_approx // self.block_size) * self.block_size
+        if trim_count_approx <= 0:
+            return
+
+        # Count features that will be trimmed (same logic as compact_session).
+        num_features_to_trim = 0
+        for mm_feature in session.mm_features:
+            end_pos = mm_feature.mm_position.offset + mm_feature.mm_position.length
+            if end_pos <= trim_count_approx:
+                num_features_to_trim += 1
+            else:
+                break
+
+        # Free encoder cache references before trimming.
+        if num_features_to_trim > 0:
+            self.encoder_cache_manager.compact_encoder_cache(
+                session, num_features_to_trim
+            )
+
+        # Perform the actual compaction on the request.
+        result = session.compact_session(
+            keep_tokens=self._compaction_keep_tokens,
+            block_size=self.block_size,
+        )
+
+        if result.num_trimmed_tokens > 0:
+            # Trim leading null_blocks from the KV cache block list.
+            self.kv_cache_manager.compact_blocks(
+                session.request_id, result.num_trimmed_blocks
+            )
+            logger.info(
+                "Session compaction for %s: trimmed %d tokens, "
+                "%d features, %d blocks (total compacted: %d tokens). "
+                "Post-state: num_tokens=%d, num_computed=%d, "
+                "num_prompt=%d, all_token_ids=%d, mm_features=%d",
+                session.request_id,
+                result.num_trimmed_tokens,
+                result.num_trimmed_features,
+                result.num_trimmed_blocks,
+                session._num_tokens_compacted,
+                session.num_tokens,
+                session.num_computed_tokens,
+                session.num_prompt_tokens,
+                len(session._all_token_ids),
+                len(session.mm_features),
+            )
 
     def _make_cached_request_data(
         self,
@@ -1369,7 +1478,14 @@ class Scheduler(SchedulerInterface):
                 if finished:
                     kv_transfer_params = self._free_request(request)
 
-                if status_before_stop == RequestStatus.RUNNING:
+                # For resumable streaming requests that were updated
+                # in-place and kept RUNNING, don't remove them from the
+                # running set. This avoids RUNNING→WAITING→RUNNING churn
+                # that starves concurrent realtime streams.
+                if request.status == RequestStatus.RUNNING and not finished:
+                    # Request was updated in-place, stays in self.running.
+                    pass
+                elif status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 else:
                     stopped_preempted_reqs.add(request)
@@ -1507,7 +1623,18 @@ class Scheduler(SchedulerInterface):
         return engine_core_outputs
 
     def _handle_stopped_request(self, request: Request) -> bool:
-        """Return True if finished (can be False for resumable requests)."""
+        """Handle a request that has stopped generating.
+
+        Returns:
+            True if the request is truly finished and should be freed.
+            False if the request is resumable and will continue.
+
+        For resumable streaming requests with a queued update, the session
+        is updated in-place and kept RUNNING to avoid scheduler churn.
+        This is critical for realtime workloads where max_tokens=1 causes
+        every token to trigger a stop, and cycling through WAITING on each
+        token starves concurrent streams.
+        """
         if not request.resumable:
             return True
 
@@ -1516,12 +1643,29 @@ class Scheduler(SchedulerInterface):
             if update is None:
                 # Streaming request finished.
                 return True
+            # Update the session with the next streaming chunk.
+            # _update_request_as_session sets status to WAITING and may
+            # trigger compaction. Track whether compaction happened.
+            compacted_before = request._num_tokens_compacted
             self._update_request_as_session(request, update)
+            compacted = request._num_tokens_compacted > compacted_before
+            if compacted:
+                # Compaction occurred — must go through NewRequestData
+                # path for full state rebuild. Stay WAITING.
+                request.num_output_placeholders = 0
+                self.waiting.add_request(request)
+            else:
+                # Keep the request RUNNING (don't transition to WAITING)
+                # so the scheduler processes it as a running request with
+                # new tokens to prefill, avoiding the RUNNING→WAITING→RUNNING
+                # churn that starves concurrent streams.
+                request.num_output_placeholders = 0
+                request.status = RequestStatus.RUNNING
         else:
             request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
             self.num_waiting_for_streaming_input += 1
+            self.waiting.add_request(request)
 
-        self.waiting.add_request(request)
         return False
 
     def _get_routed_experts(self, request: Request) -> np.ndarray | None:

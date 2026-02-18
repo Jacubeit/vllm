@@ -5,7 +5,7 @@ import enum
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -54,6 +54,15 @@ class StreamingUpdate:
             arrival_time=request.arrival_time,
             sampling_params=request.sampling_params,
         )
+
+
+@dataclass
+class CompactionResult:
+    """Result of a session compaction operation."""
+
+    num_trimmed_tokens: int
+    num_trimmed_features: int
+    num_trimmed_blocks: int
 
 
 class Request:
@@ -174,6 +183,10 @@ class Request:
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
 
+        # Session compaction: cumulative counts of trimmed data
+        self._num_tokens_compacted: int = 0
+        self._num_mm_features_compacted: int = 0
+
     @property
     @deprecated(
         "Request.eos_token_id will be removed in v0.18. "
@@ -226,6 +239,86 @@ class Request:
         """Compute block hashes for any new full blocks and append them."""
         if self._block_hasher is not None:
             self.block_hashes.extend(self._block_hasher(self))
+
+    def compact_session(self, keep_tokens: int, block_size: int) -> CompactionResult:
+        """Trim old tokens/features from a streaming session.
+
+        Removes the oldest tokens from the front of the request's data
+        structures, keeping only the most recent ``keep_tokens`` tokens.
+        This prevents unbounded CPU-side metadata growth in long-running
+        streaming sessions.
+
+        Args:
+            keep_tokens: Number of recent tokens to retain.  Must be >=
+                the model's sliding window size to cover all live KV data.
+            block_size: KV cache block size, used to align the trim
+                boundary and compute the number of blocks to trim.
+
+        Returns:
+            A :class:`CompactionResult` with the counts of trimmed tokens,
+            mm_features, and blocks.
+        """
+        assert self.resumable, "compact_session only for resumable requests"
+        total_tokens = len(self._all_token_ids)
+        if total_tokens <= keep_tokens:
+            return CompactionResult(0, 0, 0)
+
+        trim_count = total_tokens - keep_tokens
+        # Align to block boundary so block trimming is clean.
+        trim_count = (trim_count // block_size) * block_size
+        if trim_count <= 0:
+            return CompactionResult(0, 0, 0)
+
+        # --- Trim token lists ---
+        del self._all_token_ids[:trim_count]
+        assert self.prompt_token_ids is not None
+        # prompt_token_ids covers [0, num_prompt_tokens).  After session
+        # updates, output tokens are folded into prompt_token_ids so it
+        # may be very long.  Trim from the front.
+        prompt_trim = min(trim_count, len(self.prompt_token_ids))
+        del self.prompt_token_ids[:prompt_trim]
+
+        # --- Trim mm_features ---
+        # Count features whose placeholder range falls entirely within the
+        # trimmed region.
+        num_trimmed_features = 0
+        for mm_feature in self.mm_features:
+            end_pos = mm_feature.mm_position.offset + mm_feature.mm_position.length
+            if end_pos <= trim_count:
+                num_trimmed_features += 1
+            else:
+                break
+        # Remove trimmed features.
+        del self.mm_features[:num_trimmed_features]
+        # Rebase remaining features' offsets.
+        for i, mm_feature in enumerate(self.mm_features):
+            old_offset = mm_feature.mm_position.offset
+            self.mm_features[i].mm_position = replace(
+                mm_feature.mm_position, offset=old_offset - trim_count
+            )
+
+        # --- Clear block hashes (invalidated by chain dependency) ---
+        self.block_hashes.clear()
+        self._block_hasher = None  # Stop computing new hashes
+        self.skip_reading_prefix_cache = True
+
+        # --- Clear output token ids ---
+        # After session update, outputs are folded into prompt_token_ids
+        # so _output_token_ids should already be empty, but clear to be safe.
+        self._output_token_ids.clear()
+
+        # --- Update counters ---
+        self._num_tokens_compacted += trim_count
+        self._num_mm_features_compacted += num_trimmed_features
+        self.num_computed_tokens -= trim_count
+        self.num_prompt_tokens = len(self.prompt_token_ids)
+        num_trimmed_blocks = trim_count // block_size
+
+        return CompactionResult(
+            num_trimmed_tokens=trim_count,
+            num_trimmed_features=num_trimmed_features,
+            num_trimmed_blocks=num_trimmed_blocks,
+        )
 
     @property
     def use_structured_output(self) -> bool:

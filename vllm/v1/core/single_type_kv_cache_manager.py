@@ -245,6 +245,13 @@ class SingleTypeKVCacheManager(ABC):
             num_tokens: The total number of tokens that need to be cached
                 (including tokens that are already cached).
         """
+        # After session compaction, block_hashes are cleared and cannot be
+        # rebuilt (the chain is broken).  Skip caching to avoid the assertion
+        # in block_pool.cache_full_blocks that requires
+        # len(block_hashes) >= num_full_blocks.
+        if not request.block_hashes:
+            return
+
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
 
@@ -386,6 +393,42 @@ class SingleTypeKVCacheManager(ABC):
             removed_blocks.append(blocks[i])
             blocks[i] = self._null_block
         self.block_pool.free_blocks(removed_blocks)
+
+    def compact_blocks(self, request_id: str, num_blocks_to_trim: int) -> None:
+        """Trim leading blocks from req_to_blocks after compaction.
+
+        After session compaction, the leading entries in req_to_blocks
+        correspond to tokens that have been trimmed. Some may already be
+        null_block (evicted by the sliding window), others may still be
+        real blocks that need to be freed.
+
+        This method frees any real blocks and removes all leading entries
+        so that physical position 0 in the (trimmed) token list maps to
+        block index 0 in the (trimmed) block list.
+
+        Args:
+            request_id: The request ID.
+            num_blocks_to_trim: Number of leading blocks to remove.
+        """
+        if num_blocks_to_trim <= 0:
+            return
+        blocks = self.req_to_blocks.get(request_id)
+        if blocks is None:
+            return
+        num_blocks_to_trim = min(num_blocks_to_trim, len(blocks))
+        # Free any real (non-null) blocks that haven't been evicted yet.
+        blocks_to_free: list[KVCacheBlock] = []
+        for i in range(num_blocks_to_trim):
+            if blocks[i] != self._null_block:
+                blocks_to_free.append(blocks[i])
+        if blocks_to_free:
+            self.block_pool.free_blocks(blocks_to_free)
+        del blocks[:num_blocks_to_trim]
+        # Also adjust num_cached_block if tracking is active.
+        if request_id in self.num_cached_block:
+            self.num_cached_block[request_id] = max(
+                0, self.num_cached_block[request_id] - num_blocks_to_trim
+            )
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
