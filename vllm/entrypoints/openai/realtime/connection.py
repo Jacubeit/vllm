@@ -63,9 +63,26 @@ class RealtimeConnection:
 
         try:
             while True:
-                message = await self.websocket.receive_text()
+                message = await self.websocket.receive()
+                # Handle disconnect (receive() doesn't raise
+                # WebSocketDisconnect like receive_text() does)
+                if message.get("type") == "websocket.disconnect":
+                    raise WebSocketDisconnect(code=message.get("code", 1000))
+                if message.get("bytes"):
+                    # Binary frame: raw PCM16 audio, no JSON/base64
+                    audio_bytes = message["bytes"]
+                    audio_array = (
+                        np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+                        / 32768.0
+                    )
+                    if len(audio_array) > 0:
+                        self.audio_queue.put_nowait(audio_array)
+                    continue
+                text = message.get("text")
+                if text is None:
+                    continue
                 try:
-                    event = json.loads(message)
+                    event = json.loads(text)
                     await self.handle_event(event)
                 except json.JSONDecodeError:
                     await self.send_error("Invalid JSON", "invalid_json")
