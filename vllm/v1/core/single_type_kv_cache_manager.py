@@ -245,6 +245,13 @@ class SingleTypeKVCacheManager(ABC):
             num_tokens: The total number of tokens that need to be cached
                 (including tokens that are already cached).
         """
+        # After session compaction, block_hashes are cleared because
+        # prefix caching is irrelevant for streaming sessions.  Skip
+        # caching to avoid the assertion in block_pool.cache_full_blocks
+        # that requires len(block_hashes) >= num_full_blocks.
+        if not request.block_hashes:
+            return
+
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
 

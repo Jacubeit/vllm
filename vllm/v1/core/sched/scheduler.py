@@ -1004,6 +1004,27 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
 
+        # --- In-place compaction of CPU-side metadata ---
+        # Trim already-processed mm_features and block_hashes so the
+        # scheduler's O(n) encoder-input scan stays bounded.  Only fires
+        # for resumable (streaming) sessions once enough features
+        # accumulate.  We free encoder-cache references for the trimmed
+        # features BEFORE the trim (free_encoder_input looks up by index).
+        if session.resumable:
+            trim_count = session.num_compactable_mm_features()
+            if trim_count > 0:
+                for i in range(trim_count):
+                    self.encoder_cache_manager.free_encoder_input(session, i)
+                session.compact_mm_features(trim_count)
+                logger.debug(
+                    "Compacted session %s: trimmed %d mm_features, "
+                    "%d remaining, %d total tokens",
+                    session.request_id,
+                    trim_count,
+                    len(session.mm_features),
+                    session.num_tokens,
+                )
+
     def _make_cached_request_data(
         self,
         running_reqs: list[Request],

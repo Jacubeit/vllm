@@ -267,6 +267,57 @@ class Request:
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)
 
+    def num_compactable_mm_features(self) -> int:
+        """Count mm_features fully within the already-computed range.
+
+        A feature is compactable when its entire token span lies before
+        ``num_computed_tokens`` — meaning the encoder output has been
+        consumed and folded into the decoder KV cache.
+
+        Returns:
+            Number of leading mm_features that can be safely trimmed.
+        """
+        num_computed = self.num_computed_tokens
+        count = 0
+        for feat in self.mm_features:
+            end_pos = feat.mm_position.offset + feat.mm_position.length
+            if end_pos <= num_computed:
+                count += 1
+            else:
+                # mm_features are ordered by offset — once we hit one that
+                # isn't fully computed, the rest won't be either.
+                break
+        return count
+
+    def compact_mm_features(self, trim_count: int) -> None:
+        """Trim *trim_count* leading mm_features in-place.
+
+        The caller is responsible for freeing encoder-cache entries for
+        the trimmed features **before** calling this method (because
+        ``encoder_cache_manager.free_encoder_input`` looks up features
+        by index).
+
+        Also clears ``block_hashes`` / ``_block_hasher`` so that
+        ``update_block_hashes`` and ``cache_blocks`` become no-ops.
+        The sliding-window manager already evicts old blocks on the GPU
+        side, and ``cache_blocks`` is guarded for empty hashes.
+
+        Does **not** touch ``_all_token_ids``, ``prompt_token_ids``,
+        ``num_computed_tokens``, or ``num_prompt_tokens`` — the model
+        runner depends on these staying in sync with the KV cache.
+        """
+        if trim_count <= 0:
+            return
+
+        del self.mm_features[:trim_count]
+
+        # Clear block hashes — the scheduler doesn't need them for
+        # streaming requests (prefix caching is irrelevant mid-stream),
+        # and clearing prevents the O(n) growth.  cache_blocks() is
+        # guarded for empty hashes so this is safe.
+        self.block_hashes.clear()
+        self._block_hasher = None
+
     def get_finished_reason(self) -> FinishReason | None:
         return RequestStatus.get_finished_reason(self.status)
 

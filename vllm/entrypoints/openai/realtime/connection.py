@@ -302,6 +302,7 @@ class RealtimeConnection:
         total_tokens: int = 0
         total_text_tokens: int = 0
         last_log = time.monotonic()
+        tokens_at_last_log: int = 0
 
         try:
             from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -371,15 +372,23 @@ class RealtimeConnection:
                     # --- Periodic status log ---
                     now = time.monotonic()
                     if now - last_log >= 10.0:
+                        elapsed = now - last_log
+                        tok_s = (
+                            ((total_tokens - tokens_at_last_log) / elapsed)
+                            if elapsed > 0
+                            else 0
+                        )
                         logger.info(
-                            "%s: %d tok, %d text, streak=%d, queue=%d",
+                            "%s: %d tok, %d text, streak=%d, queue=%d, %.1f tok/s",
                             request_id[:20],
                             total_tokens,
                             total_text_tokens,
                             non_text_streak,
                             self.audio_queue.qsize(),
+                            tok_s,
                         )
                         last_log = now
+                        tokens_at_last_log = total_tokens
 
                 if not self._is_connected:
                     break
