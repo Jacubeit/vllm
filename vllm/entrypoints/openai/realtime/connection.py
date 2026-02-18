@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import json
+import time
 from collections.abc import AsyncGenerator
 from http import HTTPStatus
 from uuid import uuid4
@@ -36,9 +37,40 @@ class RealtimeConnection:
     - WebSocket connection lifecycle (accept, receive, send, close)
     - Event routing (session.update, append, commit)
     - Audio buffering via asyncio.Queue
-    - Generation task management
+    - Generation task management with automatic pipeline rotation
+    - Silence-loop recovery (non-text streak detection)
     - Error handling and cleanup
+
+    Long-running streaming sessions are kept healthy by two mechanisms:
+
+    1. **Proactive rotation** — after ``MAX_SESSION_TOKENS`` tokens the
+       generation pipeline is cleanly restarted, bounding CPU-side
+       metadata growth (token lists, multimodal features, block tables)
+       that would otherwise grow without limit.
+
+    2. **Deaf recovery** — if the model emits ``MAX_NON_TEXT_STREAK``
+       consecutive non-text tokens (silence/pad/control, token id < 1000)
+       the pipeline is aborted and restarted.  This matches the strategy
+       used by `voxtral.c <https://github.com/antirez/voxtral.c>`_
+       (``STREAM_MAX_NON_TEXT_STREAK = 64``).
+
+    Audio continues flowing from the WebSocket into ``audio_queue``
+    throughout any restart, so no frames are lost.
     """
+
+    # Tokens below this id are non-text (silence, pad, control).
+    # voxtral.c uses ``token < 1000``.
+    NON_TEXT_TOKEN_THRESHOLD: int = 1000
+
+    # Abort after this many consecutive non-text tokens.
+    MAX_NON_TEXT_STREAK: int = 64
+
+    # Give up after this many consecutive restarts that produce zero text.
+    MAX_EMPTY_RESTARTS: int = 5
+
+    # Proactively restart the pipeline after this many output tokens to
+    # bound unbounded CPU-side metadata growth in the scheduler.
+    MAX_SESSION_TOKENS: int = 2048
 
     def __init__(self, websocket: WebSocket, serving: OpenAIServingRealtime):
         self.websocket = websocket
@@ -181,43 +213,97 @@ class RealtimeConnection:
             logger.warning("Generation already in progress, ignoring commit")
             return
 
-        # Create audio stream generator
-        audio_stream = self.audio_stream_generator()
-        input_stream = asyncio.Queue[list[int]]()
+        self.generation_task = asyncio.create_task(self._generation_loop())
 
-        # Transform to StreamingInput generator
-        streaming_input_gen = self.serving.transcribe_realtime(
-            audio_stream, input_stream
-        )
+    async def _generation_loop(self):
+        """Run generation with automatic restart on rotation or deafness.
 
-        # Start generation task
-        self.generation_task = asyncio.create_task(
-            self._run_generation(streaming_input_gen, input_stream)
-        )
+        Each iteration creates a fresh audio/token pipeline and runs
+        ``_run_generation`` until it returns.  The return value indicates
+        whether to restart (``True``/``False``) or stop (``None``).
+        """
+        empty_restarts = 0
+        restart_count = 0
+
+        while self._is_connected:
+            audio_stream = self.audio_stream_generator()
+            input_stream = asyncio.Queue[list[int]]()
+            streaming_input_gen = self.serving.transcribe_realtime(
+                audio_stream, input_stream
+            )
+
+            try:
+                produced_text = await self._run_generation(
+                    streaming_input_gen, input_stream
+                )
+            except Exception:
+                logger.exception(
+                    "%s: _run_generation raised unexpectedly",
+                    self.connection_id,
+                )
+                produced_text = None
+
+            if produced_text is not None:
+                # Restart path — push a sentinel so the old
+                # audio_stream_generator exits naturally (calling
+                # aclose() on a running async generator raises
+                # RuntimeError).
+                self.audio_queue.put_nowait(None)
+                await asyncio.sleep(0.1)
+
+            if produced_text is None:
+                break
+
+            if not produced_text:
+                empty_restarts += 1
+                logger.warning(
+                    "%s: restart produced no text (empty_restarts=%d/%d)",
+                    self.connection_id,
+                    empty_restarts,
+                    self.MAX_EMPTY_RESTARTS,
+                )
+                if empty_restarts >= self.MAX_EMPTY_RESTARTS:
+                    logger.error(
+                        "%s: too many empty restarts, giving up",
+                        self.connection_id,
+                    )
+                    break
+            else:
+                empty_restarts = 0
+
+            restart_count += 1
+            logger.info(
+                "%s: restarting generation pipeline (restart #%d, queue=%d)",
+                self.connection_id,
+                restart_count,
+                self.audio_queue.qsize(),
+            )
 
     async def _run_generation(
         self,
         streaming_input_gen: AsyncGenerator,
         input_stream: asyncio.Queue[list[int]],
-    ):
-        """Run the generation and stream results back to the client.
+    ) -> bool | None:
+        """Run a single generation session.
 
-        This method:
-        1. Creates sampling parameters from session config
-        2. Passes the streaming input generator to engine.generate()
-        3. Streams transcription.delta events as text is generated
-        4. Sends final transcription.done event with usage stats
-        5. Feeds generated token IDs back to input_stream for next iteration
-        6. Cleans up the audio queue
+        Returns:
+            ``True``  — restart requested, text was produced.
+            ``False`` — restart requested, no text was produced.
+            ``None``  — normal completion or error, do not restart.
         """
         request_id = f"rt-{self.connection_id}-{uuid4()}"
         full_text = ""
+        deaf_restart = False
 
         prompt_token_ids_len: int = 0
         completion_tokens_len: int = 0
 
+        non_text_streak: int = 0
+        total_tokens: int = 0
+        total_text_tokens: int = 0
+        last_log = time.monotonic()
+
         try:
-            # Create sampling params
             from vllm.sampling_params import RequestOutputKind, SamplingParams
 
             sampling_params = SamplingParams.from_optional(
@@ -227,50 +313,97 @@ class RealtimeConnection:
                 skip_clone=True,
             )
 
-            # Pass the streaming input generator to the engine
-            # The engine will consume audio chunks as they arrive and
-            # stream back transcription results incrementally
             result_gen = self.serving.engine_client.generate(
                 prompt=streaming_input_gen,
                 sampling_params=sampling_params,
                 request_id=request_id,
             )
 
-            # Stream results back to client as they're generated
             async for output in result_gen:
                 if output.outputs and len(output.outputs) > 0:
                     if not prompt_token_ids_len and output.prompt_token_ids:
                         prompt_token_ids_len = len(output.prompt_token_ids)
 
                     delta = output.outputs[0].text
+                    token_ids = output.outputs[0].token_ids
                     full_text += delta
+                    total_tokens += 1
 
-                    # append output to input
-                    input_stream.put_nowait(list(output.outputs[0].token_ids))
+                    input_stream.put_nowait(list(token_ids))
                     await self.send(TranscriptionDelta(delta=delta))
 
-                    completion_tokens_len += len(output.outputs[0].token_ids)
+                    completion_tokens_len += len(token_ids)
+
+                    # --- Deaf detection ---
+                    if token_ids and token_ids[-1] < self.NON_TEXT_TOKEN_THRESHOLD:
+                        non_text_streak += 1
+                    else:
+                        non_text_streak = 0
+                        total_text_tokens += 1
+
+                    if non_text_streak >= self.MAX_NON_TEXT_STREAK:
+                        logger.warning(
+                            "%s: deaf detected — %d consecutive non-text "
+                            "tokens (last_tid=%s, total=%d, text=%d). "
+                            "Aborting for restart.",
+                            request_id[:20],
+                            non_text_streak,
+                            token_ids,
+                            total_tokens,
+                            total_text_tokens,
+                        )
+                        deaf_restart = True
+                        await self.serving.engine_client.abort(request_id)
+                        break
+
+                    # --- Proactive rotation ---
+                    if total_tokens >= self.MAX_SESSION_TOKENS:
+                        logger.info(
+                            "%s: proactive rotation at %d tokens "
+                            "(%d text). Restarting.",
+                            request_id[:20],
+                            total_tokens,
+                            total_text_tokens,
+                        )
+                        await self.serving.engine_client.abort(request_id)
+                        return True
+
+                    # --- Periodic status log ---
+                    now = time.monotonic()
+                    if now - last_log >= 10.0:
+                        logger.info(
+                            "%s: %d tok, %d text, streak=%d, queue=%d",
+                            request_id[:20],
+                            total_tokens,
+                            total_text_tokens,
+                            non_text_streak,
+                            self.audio_queue.qsize(),
+                        )
+                        last_log = now
 
                 if not self._is_connected:
-                    # finish because websocket connection was killed
                     break
 
+            if deaf_restart:
+                return total_text_tokens > 0
+
+            # Normal completion
             usage = UsageInfo(
                 prompt_tokens=prompt_token_ids_len,
                 completion_tokens=completion_tokens_len,
                 total_tokens=prompt_token_ids_len + completion_tokens_len,
             )
-
-            # Send final completion event
             await self.send(TranscriptionDone(text=full_text, usage=usage))
 
-            # Clear queue for next utterance
             while not self.audio_queue.empty():
                 self.audio_queue.get_nowait()
+
+            return None
 
         except Exception as e:
             logger.exception("Error in generation: %s", e)
             await self.send_error(str(e), "processing_error")
+            return None
 
     async def send(
         self, event: SessionCreated | TranscriptionDelta | TranscriptionDone
