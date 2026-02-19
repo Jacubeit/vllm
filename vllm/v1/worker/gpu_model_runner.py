@@ -1576,9 +1576,8 @@ class GPUModelRunner(
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         # Session compaction: add compaction offsets to positions for RoPE.
-        # positions_np currently holds physical (bounded) positions used above
-        # for token_indices and slot_mapping. For RoPE, we need logical
-        # positions that reflect the true conversation position so that
+        # Physical positions (used for slot_mapping above) are bounded.
+        # RoPE positions must reflect the true logical position so that
         # Q vectors match the K vectors already in the KV cache.
         compaction_offsets = self.input_batch.compaction_offsets_cpu[req_indices]
         if compaction_offsets.any():

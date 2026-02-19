@@ -1990,6 +1990,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.remove_skipped_blocks(
             request_id=request.request_id,
             total_computed_tokens=request.num_tokens,
+            compacted_tokens=request._num_tokens_compacted,
         )
 
         block_ids = self.kv_cache_manager.get_block_ids(request.request_id)

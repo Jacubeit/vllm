@@ -352,7 +352,10 @@ class SingleTypeKVCacheManager(ABC):
         raise NotImplementedError
 
     def remove_skipped_blocks(
-        self, request_id: str, total_computed_tokens: int
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        compacted_tokens: int = 0,
     ) -> None:
         """
         Remove and free the blocks that are no longer needed for attention computation.
@@ -365,9 +368,19 @@ class SingleTypeKVCacheManager(ABC):
             request_id: The request ID.
             total_computed_tokens: The total number of computed tokens, including
                 local computed tokens and external computed tokens.
+            compacted_tokens: Number of tokens previously removed by session
+                compaction.  After compaction the block list is shortened so
+                physical index 0 corresponds to the first *kept* token.  The
+                skip count must be converted from logical (absolute) to
+                physical (relative to the compacted block list).
         """
         # Remove the blocks that will be skipped during attention computation.
-        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
+        # After compaction, total_computed_tokens is the *physical* count.
+        # We must compute the skip in logical space (physical + compacted)
+        # then convert back to physical by subtracting compacted_tokens.
+        logical_computed = total_computed_tokens + compacted_tokens
+        logical_skipped = self.get_num_skipped_tokens(logical_computed)
+        num_skipped_tokens = max(0, logical_skipped - compacted_tokens)
         if num_skipped_tokens <= 0:
             # This indicates that ALL tokens are inside attention window.
             # Thus we do not need to free any blocks outside attention window.
@@ -855,7 +868,12 @@ class MambaManager(SingleTypeKVCacheManager):
 
         return computed_blocks
 
-    def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        compacted_tokens: int = 0,
+    ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
 
         # NOTE (tdoublep) with async scheduling, the num_computed_tokens can contain
@@ -863,9 +881,13 @@ class MambaManager(SingleTypeKVCacheManager):
         # This can make us think we are further ahead in the sequence than we actually
         # are, so let's assume that all tokens are rejected so we don't free blocks
         # that we might actually need.
-        num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)
+        total_computed_tokens = max(
+            0, total_computed_tokens - self.num_speculative_blocks
+        )
 
-        super().remove_skipped_blocks(request_id, num_computed_tokens)
+        super().remove_skipped_blocks(
+            request_id, total_computed_tokens, compacted_tokens=compacted_tokens
+        )
         if self.mamba_cache_mode == "align":
             # `last_state_block_idx` refers to the block index allocated two steps ago.
             # The block allocated in the previous step is used to copy Mamba states
@@ -878,7 +900,7 @@ class MambaManager(SingleTypeKVCacheManager):
             if (
                 last_state_block_idx is not None
                 and last_state_block_idx
-                < cdiv(num_computed_tokens, self.block_size) - 1
+                < cdiv(total_computed_tokens, self.block_size) - 1
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:

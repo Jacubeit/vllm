@@ -216,7 +216,10 @@ class KVCacheCoordinator(ABC):
         ]
 
     def remove_skipped_blocks(
-        self, request_id: str, total_computed_tokens: int
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        compacted_tokens: int = 0,
     ) -> None:
         """
         Remove the blocks that are no longer needed from `blocks` and replace
@@ -226,9 +229,16 @@ class KVCacheCoordinator(ABC):
             request_id: The request ID.
             total_computed_tokens: The total number of computed tokens, including
                 local computed tokens and external computed tokens.
+            compacted_tokens: Number of tokens previously removed by session
+                compaction, used to adjust the skip calculation so that
+                blocks still within the sliding window are not freed.
         """
         for manager in self.single_type_managers:
-            manager.remove_skipped_blocks(request_id, total_computed_tokens)
+            manager.remove_skipped_blocks(
+                request_id,
+                total_computed_tokens,
+                compacted_tokens=compacted_tokens,
+            )
 
     def compact_blocks(self, request_id: str, num_blocks_to_trim: int) -> None:
         """Trim leading null_blocks from req_to_blocks after compaction.
